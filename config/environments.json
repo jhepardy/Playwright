@@ -1,0 +1,17 @@
+{
+  "dev": {
+    "baseURL": "https://example.com",
+    "apiBaseURL": "https://api.example.com",
+    "timeouts": { "default": 15000, "navigation": 45000 }
+  },
+  "staging": {
+    "baseURL": "https://staging.example.com",
+    "apiBaseURL": "https://api.staging.example.com",
+    "timeouts": { "default": 15000, "navigation": 45000 }
+  },
+  "prod": {
+    "baseURL": "https://www.example.com",
+    "apiBaseURL": "https://api.example.com",
+    "timeouts": { "default": 20000, "navigation": 60000 }
+  }
+}
