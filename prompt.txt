@@ -1,0 +1,287 @@
+1. Folder structure (clean architecture, small team)
+Path	Responsibility
+playwright.config.ts	Runner behavior: timeouts, retries, reporters, traces, screenshots/video, projects (browsers vs API).
+config/environments.json	Non-secret defaults per env; overridden by BASE_URL / API_BASE_URL from CI or .env.
+src/fixtures/	Composition root for tests: extended test, shared setup (apiClient, optional loginAsDefaultUser).
+src/pages/	Page Object Model: one class per screen, thin methods (“user intent”), locators centralized.
+src/actions/	Reusable UI primitives (click, type, wait, iframe, uploads) so pages don’t repeat policy.
+src/api/	API client + page.route helpers for hybrid tests.
+src/helpers/	Cross-cutting flows (auth, multi-tab).
+src/utils/	Env resolution, logging, JSON test-data loader.
+test-data/	Versioned datasets (JSON); secrets stay in env/secret store, not in git.
+tests/ui, tests/api, tests/hybrid	Specs grouped by kind; tags in titles for grep-based suites.
+.github/workflows/	CI: install, sharding, artifacts.
+Dockerfile	Same suite in a Playwright base image for “Docker parity” with CI.
+Why: Config and “wiring” stay at the edges; tests depend on fixtures and pages, not on raw playwright.config. A small team gets one obvious place to add a new page, a new action, or a new fixture without a framework-in-a-framework.
+
+POM vs “better”: For most teams, POM + thin actions is the best cost/benefit. Alternatives like Screenplay/User-centric models shine at very large scale but add ceremony. Here, components can appear later as partial widgets inside pages if duplication grows.
+
+2. Sample implementation (from this repo)
+Base test setup (fixtures = scalable hook point)
+All specs import test / expect from one module so behavior stays consistent:
+
+
+base.fixture.ts
+Lines 1-44
+import { test as base, expect } from '@playwright/test';
+import { ApiClient } from '../api/client.js';
+import { envConfig } from '../utils/env.js';
+import type { Credentials } from '../helpers/auth.helper.js';
+import { loginViaUi } from '../helpers/auth.helper.js';
+type Fixtures = {
+  /** Opt-in: add `loginAsDefaultUser` to the test args to run UI login first. */
+  loginAsDefaultUser: void;
+  apiClient: ApiClient;
+};
+const creds: Credentials = {
+  email: process.env.E2E_USER_EMAIL ?? 'qa+e2e@example.com',
+  password: process.env.E2E_USER_PASSWORD ?? '',
+};
+/**
+ * Single `test` export: all specs import from here so fixtures and hooks stay centralized.
+ */
+export const test = base.extend<Fixtures>({
+  apiClient: async ({ request }, use) => {
+    const { apiBaseURL } = envConfig();
+    const client = new ApiClient(request, apiBaseURL);
+    await use(client);
+  },
+  loginAsDefaultUser: async ({ page, context }, use, testInfo) => {
+    if (!creds.password) {
+      testInfo.skip(true, 'Set E2E_USER_PASSWORD for authenticated UI flows');
+    } else {
+      await loginViaUi(page, creds);
+    }
+    await use(undefined);
+    await context.clearCookies();
+  },
+});
+export { expect };
+Why: Playwright fixtures are the industry-standard extension point (auth, API client, default headers, storage state). Opt-in loginAsDefaultUser avoids logging in for every test.
+
+Page Object + actions (separation of concerns)
+
+base.page.ts
+Lines 1-36
+import type { Locator, Page } from '@playwright/test';
+import { UiActions } from '../actions/ui.actions.js';
+/**
+ * Base page: shared wiring + dynamic locator helpers. Prefer `getByRole`/`getByTestId`
+ * from Playwright; fall back to resilient strategies when the DOM is unstable.
+ */
+export abstract class BasePage {
+  readonly actions: UiActions;
+  constructor(protected readonly page: Page) {
+    this.actions = new UiActions(page);
+  }
+  /** Prefer stable `data-testid` from app; centralize strings to avoid typos. */
+  protected byTestId(testId: string): Locator {
+    return this.page.getByTestId(testId);
+  }
+  /**
+   * Dynamic text: escape user-controlled fragments to reduce brittle XPath/CSS.
+   * For i18n apps, key off test ids or ARIA, not visible copy.
+   */
+  protected byRoleWithName(role: Parameters<Page['getByRole']>[0], name: string | RegExp): Locator {
+    return this.page.getByRole(role, { name });
+  }
+  protected locator(selector: string): Locator {
+    return this.page.locator(selector);
+  }
+}
+
+login.page.ts
+Lines 1-28
+import type { Page } from '@playwright/test';
+import { BasePage } from './base.page.js';
+/** Example POM: one place per screen; methods read like user intent. */
+export class LoginPage extends BasePage {
+  constructor(page: Page) {
+    super(page);
+  }
+  private emailInput() {
+    return this.byTestId('login-email');
+  }
+  private passwordInput() {
+    return this.byTestId('login-password');
+  }
+  private submitButton() {
+    return this.page.getByRole('button', { name: /sign in|log in/i });
+  }
+  async open() {
+    await this.actions.goto('/login');
+  }
+  async login(email: string, password: string) {
+    await this.actions.type(this.emailInput(), email);
+    await this.actions.type(this.passwordInput(), password);
+    await this.actions.click(this.submitButton());
+  }
+}
+Why: Locators and “what the user does” live in the page; how you click/fill/wait is centralized in UiActions (iframe, upload, expect().toPass for soft async UI).
+
+Test spec (tags + data-driven JSON)
+
+todo-mvc.spec.ts
+Lines 1-18
+import { test, expect } from '../../src/fixtures/base.fixture.js';
+import { TodoPage } from '../../src/pages/todo.page.js';
+import { loadJson } from '../../src/utils/test-data.js';
+test.describe('@smoke @ui', () => {
+  test('creates a todo (data-driven label)', async ({ page }) => {
+    const users = loadJson<{ validUser: { email: string } }>('users.json');
+    const todo = new TodoPage(page);
+    await todo.open();
+    await todo.actions.type(todo.input(), `Ship release for ${users.validUser.email}`);
+    await todo.input().press('Enter');
+    await expect(todo.item(users.validUser.email)).toBeVisible();
+  });
+});
+Why: Tags in describe/test titles work with npx playwright test --grep @smoke. JSON keeps data reviewable in PRs; API-driven data can use the same fixture pattern with request in a beforeAll.
+
+Utility / helper modules
+Auth (UI vs API token): src/helpers/auth.helper.ts — UI login for true E2E; API token when you want speed and your backend supports it.
+API + intercept: src/api/client.ts, src/api/interceptor.ts — hybrid tests and stable stubs for flaky third parties.
+Tabs: src/helpers/tabs.helper.ts — explicit multi-tab handling (bring to front, new page).
+Env: src/utils/env.ts — merges config/environments.json with process env for dev/staging/prod.
+3. Example playwright.config.ts
+
+playwright.config.ts
+Lines 1-52
+import { defineConfig, devices } from '@playwright/test';
+import dotenv from 'dotenv';
+import path from 'path';
+dotenv.config({ path: path.resolve(__dirname, '.env') });
+const envName = process.env.TEST_ENV ?? 'dev';
+const isCI = !!process.env.CI;
+/**
+ * Central config: retries, traces, reporters, and projects live here so
+ * local vs CI behavior stays consistent and discoverable.
+ */
+export default defineConfig({
+  testDir: './tests',
+  fullyParallel: true,
+  forbidOnly: isCI,
+  retries: isCI ? 2 : 0,
+  workers: isCI ? undefined : undefined,
+  reporter: [
+    ['list'],
+    ['html', { open: 'never', outputFolder: 'playwright-report' }],
+    ['json', { outputFile: 'test-results/results.json' }],
+  ],
+  timeout: 60_000,
+  expect: { timeout: 15_000 },
+  use: {
+    // Default demo host so smoke tests run without local app; override per env in CI.
+    baseURL: process.env.BASE_URL ?? 'https://demo.playwright.dev',
+    trace: isCI ? 'on-first-retry' : 'retain-on-failure',
+    screenshot: 'only-on-failure',
+    video: isCI ? 'retain-on-failure' : 'off',
+    actionTimeout: 15_000,
+    navigationTimeout: 45_000,
+    ignoreHTTPSErrors: envName !== 'prod',
+  },
+  projects: [
+    {
+      name: 'chromium',
+      testIgnore: /\/api\//,
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
+      name: 'mobile-chrome',
+      testIgnore: /\/api\//,
+      use: { ...devices['Pixel 7'] },
+    },
+    {
+      name: 'api',
+      testMatch: /\/api\/.*\.spec\.ts/,
+      use: { baseURL: process.env.API_BASE_URL ?? process.env.BASE_URL },
+    },
+  ],
+});
+Why:
+
+Retries on CI only: reduces noise from infra flakiness; local stays strict for fast feedback.
+Trace on first retry + screenshot/video on failure: balances storage cost with debuggability.
+Projects: API specs don’t spin up browsers unnecessarily; browser projects ignore tests/api/.
+Parallel: fullyParallel + CI sharding (below) scales with team and machine count.
+4. CI/CD (GitHub Actions + Docker)
+GitHub Actions (sharded matrix + HTML/report artifacts):
+
+
+playwright.yml
+Lines 1-44
+name: Playwright
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+jobs:
+  test:
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shardIndex: [1, 2]
+        shardTotal: [2]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+      - name: Run tests (parallel workers + sharding)
+        env:
+          CI: true
+          TEST_ENV: staging
+          BASE_URL: https://demo.playwright.dev
+        run: npx playwright test --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }}
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright-report-shard-${{ matrix.shardIndex }}
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
+Jenkins / GitLab: Same commands: npm ci, npx playwright install --with-deps, npx playwright test --shard=i/n, publish playwright-report/ and test-results/ as job artifacts. Use the official Playwright Docker image as agent or as in this repo’s Dockerfile.
+
+Docker (local/CI parity):
+
+
+Dockerfile
+Lines 1-8
+# Run: docker build -t e2e . && docker run --rm e2e
+FROM mcr.microsoft.com/playwright:v1.51.0-jammy
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+ENV CI=true
+CMD ["npx", "playwright", "test"]
+5. Best practices and anti-patterns
+Practices
+
+Stability: Prefer getByRole, getByLabel, getByTestId (with app collaboration on test ids). Rely on Playwright auto-waiting; add expect().toPass only for legitimate async UI.
+Flakiness: Fix the product or environment first; use retries on CI as a safety net, not a substitute. Use trace on first retry to debug.
+Data: Short-lived accounts in lower envs; seed via API where possible; never commit prod secrets—use E2E_* env vars or your vault.
+Hybrid: Assert UI outcomes; use API to arrange state. Mock only third parties or unstable partners via page.route.
+Auth: Prefer storageState produced once (global setup or fixture) over full UI login in every test.
+Grouping: Tags in titles + npm run test:smoke style scripts (see package.json).
+Anti-patterns
+
+Giant page classes with hundreds of lines and no actions layer.
+CSS/XPath copied from DevTools without semantic locators.
+Hard sleeps (waitForTimeout) instead of assertions on state.
+Assertions in page objects (keep assertions in specs; pages return locators / perform steps).
+One project running API + UI specs on every browser (waste and confusion).
+Storing passwords in JSON next to tests.
+Commands (reference)
+Local: npm test, npm run test:smoke, npm run report
+Docker: docker build -t e2e . && docker run --rm e2e
+If you want next steps in-repo, we can add a global-setup that writes storageState for logged-in suites, or a Jenkinsfile / .gitlab-ci.yml mirroring the GitHub workflow.
